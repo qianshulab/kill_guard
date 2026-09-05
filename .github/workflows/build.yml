@@ -4,23 +4,19 @@ on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: Install cross-compiler
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev
 
-      - name: Download kernel
+      - name: Download and prepare kernel
         run: |
           cd /tmp
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.38.tar.xz
           tar xf linux-6.12.38.tar.xz
-
-      - name: Configure kernel
-        run: |
-          cd /tmp/linux-6.12.38
+          cd linux-6.12.38
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
@@ -29,25 +25,24 @@ jobs:
           ./scripts/config --disable CONFIG_MODULE_SIG_FORCE
           ./scripts/config --disable CONFIG_DEBUG_INFO
           ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          ./scripts/config --disable CONFIG_DEBUG_INFO_DWARF5
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-
-      - name: Prepare kernel
-        run: |
-          cd /tmp/linux-6.12.38
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- prepare -j$(nproc) 2>&1 | tail -3
-          ls include/generated/bounds.h && echo "bounds.h OK"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc) 2>&1 | tail -3
+          # 构建少量内核模块以生成 Module.symvers
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=kernel/kheaders 2>&1 | tail -3 || true
+          ls Module.symvers 2>/dev/null && echo "Module.symvers OK" || echo "No Module.symvers (will use KBUILD_MODPOST_WARN)"
 
       - name: Build module
         run: |
           mkdir -p /tmp/modbuild
           cp $GITHUB_WORKSPACE/kill_guard.c /tmp/modbuild/
-          printf 'obj-m += kill_guard.o\nKDIR := /tmp/linux-6.12.38\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules\n' > /tmp/modbuild/Makefile
+          printf 'obj-m += kill_guard.o\nKDIR := /tmp/linux-6.12.38\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_MODPOST_WARN=1 modules\n' > /tmp/modbuild/Makefile
           cd /tmp/modbuild
           make 2>&1 | tail -15
           ls -la kill_guard.ko
           file kill_guard.ko
 
-      - name: Upload module
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: kill_guard-module
