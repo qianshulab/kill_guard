@@ -1,4 +1,4 @@
-name: Build kill_guard (generic kernel + objcopy patch)
+name: Build kill_guard (linker patch)
 on: [push, workflow_dispatch]
 
 jobs:
@@ -9,98 +9,74 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev binutils-aarch64-linux-gnu
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev
 
-      - name: Build generic kernel module
+      - name: Build module (generic kernel)
         run: |
           cd /tmp
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.38.tar.xz
-          tar xf linux-6.12.38.tar.xz --wildcards "linux-6.12.38/include/*" "linux-6.12.38/arch/arm64/include/*" "linux-6.12.38/scripts/*" "linux-6.12.38/Makefile" "linux-6.12.38/Kbuild" "linux-6.12.38/Kconfig" "linux-6.12.38/init/*" "linux-6.12.38/kernel/*" "linux-6.12.38/lib/*" "linux-6.12.38/mm/*" "linux-6.12.38/security/*" "linux-6.12.38/block/*" "linux-6.12.38/fs/*" "linux-6.12.38/net/*" "linux-6.12.38/drivers/*" "linux-6.12.38/usr/*" "linux-6.12.38 certs/*" 2>/dev/null
-
+          tar xf linux-6.12.38.tar.xz
           cd linux-6.12.38
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-          ./scripts/config --enable CONFIG_MODULES
-          ./scripts/config --enable CONFIG_KPROBES
-          ./scripts/config --enable CONFIG_MODULE_UNLOAD
-          ./scripts/config --disable CONFIG_MODULE_SIG
-          ./scripts/config --disable CONFIG_DEBUG_INFO
-          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          ./scripts/config --enable CONFIG_MODULES --enable CONFIG_KPROBES --enable CONFIG_MODULE_UNLOAD
+          ./scripts/config --disable CONFIG_MODULE_SIG --disable CONFIG_DEBUG_INFO --disable CONFIG_DEBUG_INFO_BTF
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc) 2>&1 | tail -3
 
-          mkdir -p /tmp/modbuild
-          cp $GITHUB_WORKSPACE/kill_guard.c /tmp/modbuild/
-          printf 'obj-m += kill_guard.o\nKDIR := /tmp/linux-6.12.38\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_MODPOST_WARN=1 modules\n' > /tmp/modbuild/Makefile
-          cd /tmp/modbuild
+          mkdir -p /tmp/modbuild && cd /tmp/modbuild
+          cp $GITHUB_WORKSPACE/kill_guard.c .
+          printf 'obj-m += kill_guard.o\nKDIR := /tmp/linux-6.12.38\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_MODPOST_WARN=1 modules\n' > Makefile
           make 2>&1 | tail -5
-          ls -la kill_guard.ko
+          ls -la kill_guard.ko && echo "BUILD OK"
 
-      - name: Patch module for OnePlus device
+      - name: Patch for OnePlus (1600 byte struct module + vermagic)
         run: |
           cd /tmp/modbuild
 
-          # 1. 用 objcopy 扩展 .gnu.linkonce.this_module 到 1600 字节
-          # 先检查当前大小
-          SIZE=$(aarch64-linux-gnu-readelf -S kill_guard.ko | grep "this_module" | awk '{print $7}' | sed 's/0x//')
-          SIZE_DEC=$((SIZE))
-          echo "当前 this_module 大小: $SIZE_DEC bytes (需要 1600)"
+          # 方法：解构 .ko → 修改 → 重新链接
+          # 1. 解构所有 section 到文件
+          aarch64-linux-gnu-objcopy -O binary --only-section=.gnu.linkonce.this_module kill_guard.ko this_module.bin
+          OLD_SIZE=$(stat -c%s this_module.bin)
+          TARGET_SIZE=1600
+          PAD=$((TARGET_SIZE - OLD_SIZE))
+          echo "this_module: $OLD_SIZE → $TARGET_SIZE (pad $PAD)"
 
-          if [ "$SIZE_DEC" -lt 1600 ]; then
-            PAD=$((1600 - SIZE_DEC))
-            echo "需要填充: $PAD bytes"
+          # 2. 扩展 this_module 数据（在末尾追加零，保持 .init/.exit 等字段位置）
+          cp this_module.bin this_module_padded.bin
+          truncate -s $TARGET_SIZE this_module_padded.bin
 
-            # 方法：创建一个填充段并合并
-            # 用 objcopy 的 --add-section 添加，然后重新链接
-            # 更简单的方法：用 dd 直接在 ELF 中插入
-
-            # 创建正确大小的填充数据
-            python3 -c "
-            with open('pad.bin', 'wb') as f:
-                f.write(b'\x00' * $PAD)
-            "
-
-            # 使用 objcopy 替换 section（先删除再添加）
-            aarch64-linux-gnu-objcopy \
-              --update-section .gnu.linkonce.this_module=pad.bin \
-              kill_guard.ko kill_guard_padded.ko 2>&1 || {
-              # 如果 --update-section 不行，用 --add-section
-              aarch64-linux-gnu-objcopy \
-                --add-section .pad=pad.bin \
-                kill_guard.ko kill_guard_padded.ko
-            }
-
-            if [ -f kill_guard_padded.ko ]; then
-              echo "✅ padded module created"
-              cp kill_guard_padded.ko kill_guard.ko
-            fi
-          fi
-
-          # 2. 修补 vermagic（用 objcopy 替换 .modinfo 段）
-          VERMAGIC="vermagic=6.12.38-android16-5-g844001fb8721-ab14552068-4k SMP preempt mod_unload modversions aarch64"
+          # 3. 解构 .modinfo
+          aarch64-linux-gnu-objcopy -O binary --only-section=.modinfo kill_guard.ko modinfo.bin
+          # 替换 vermagic
           python3 -c "
-          # 读 .modinfo 段并替换 vermagic
-          import subprocess, struct
-          data = open('kill_guard.ko','rb').read()
-          old = b'vermagic=6.12.38 SMP preempt mod_unload aarch64\x00'
-          new = b'$VERMAGIC\x00'
-          if len(new) > len(old):
-            # 需要扩展，在后面加填充
-            pad = len(new) - len(old)
-            idx = data.find(old)
-            data = data[:idx] + new + b'\x00'*pad + data[idx+len(old):]
-          else:
-            data = data.replace(old, new)
-          open('kill_guard.ko','wb').write(data)
-          print(f'vermagic patched')
+          data = open('modinfo.bin','rb').read()
+          old = b'vermagic=6.12.38 SMP preempt mod_unload aarch64'
+          new = b'vermagic=6.12.38-android16-5-g844001fb8721-ab14552068-4k SMP preempt mod_unload modversions aarch64'
+          data = data.replace(old, new)
+          open('modinfo_new.bin','wb').write(data)
           "
 
-          # 验证
-          aarch64-linux-gnu-readelf -S kill_guard.ko | grep this_module
-          strings kill_guard.ko | grep vermagic
+          # 4. 重新构建 .ko：用 objcopy 的 --update-section
+          cp kill_guard.ko kill_guard_patched.ko
+
+          # 更新 this_module section
+          aarch64-linux-gnu-objcopy \
+            --update-section .gnu.linkonce.this_module=this_module_padded.bin \
+            kill_guard_patched.ko kill_guard_patched.ko
+
+          # 更新 modinfo section
+          aarch64-linux-gnu-objcopy \
+            --update-section .modinfo=modinfo_new.bin \
+            kill_guard_patched.ko kill_guard_patched.ko
+
+          # 5. 验证
+          ls -la kill_guard_patched.ko
+          aarch64-linux-gnu-readelf -S kill_guard_patched.ko | grep -E "this_module|modinfo"
+          strings kill_guard_patched.ko | grep vermagic
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kill_guard-patched
-          path: /tmp/modbuild/kill_guard.ko
+          name: kill_guard-oneplus
+          path: /tmp/modbuild/kill_guard_patched.ko
           retention-days: 30
