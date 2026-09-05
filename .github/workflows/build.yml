@@ -8,8 +8,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cross-compiler
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev libelf-dev libdw-dev
 
       - name: Clone OnePlus SM8845 kernel
         run: |
@@ -17,13 +19,13 @@ jobs:
           git clone --depth 1 --branch oneplus/sm8845_b_16.0.0_ace_6t \
             --single-branch \
             https://github.com/OnePlusOSS/android_kernel_oneplus_sm8845.git kernel
-          cd kernel
-          echo "Kernel version: $(grep 'VERSION\|PATCHLEVEL\|SUBLEVEL' Makefile | head -3)"
 
-      - name: Configure kernel
+      - name: Prepare kernel
         run: |
           cd /tmp/kernel
-          cp $GITHUB_WORKSPACE/device_config.txt .config
+          # 用默认 ARM64 配置（避免 6.11/6.12 配置不匹配）
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          # 添加我们需要的选项
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
           ./scripts/config --enable CONFIG_MODULE_UNLOAD
@@ -32,40 +34,38 @@ jobs:
           ./scripts/config --disable CONFIG_DEBUG_INFO
           ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          # 准备模块编译环境
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc) 2>&1 | tail -5
+          echo "=== utsrelease:"
+          cat include/generated/utsrelease.h
 
-      - name: Build kill_guard
+      - name: Build module
         run: |
-          cd /tmp/kernel
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc) 2>&1 | tail -3
-
           mkdir -p /tmp/modbuild
           cp $GITHUB_WORKSPACE/kill_guard.c /tmp/modbuild/
           printf 'obj-m += kill_guard.o\nKDIR := /tmp/kernel\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_MODPOST_WARN=1 modules\n' > /tmp/modbuild/Makefile
-
           cd /tmp/modbuild
           make 2>&1 | tail -15
           ls -la kill_guard.ko
-          file kill_guard.ko
           strings kill_guard.ko | grep vermagic
-
-          # 检查 struct module 大小
+          # struct module size check
           python3 -c "
           import struct
           data = open('kill_guard.ko','rb').read()
           e_shoff = struct.unpack_from('<Q', data, 0x28)[0]
-          e_shentsize = struct.unpack_from('<H', data, 0x3a)[0]
-          e_shnum = struct.unpack_from('<H', data, 0x3c)[0]
-          e_shstrndx = struct.unpack_from('<H', data, 0x3e)[0]
-          shstr_off = e_shoff + e_shstrndx * e_shentsize
-          shstr_offset = struct.unpack_from('<Q', data, shstr_off + 0x18)[0]
-          for i in range(e_shnum):
-              off = e_shoff + i * e_shentsize
-              name_off = struct.unpack_from('<I', data, off)[0]
-              sh_size = struct.unpack_from('<Q', data, off + 0x20)[0]
-              end = data.index(0, shstr_offset + name_off)
-              name = data[shstr_offset+name_off:end].decode('ascii', errors='replace')
+          es = struct.unpack_from('<H', data, 0x3a)[0]
+          en = struct.unpack_from('<H', data, 0x3c)[0]
+          ei = struct.unpack_from('<H', data, 0x3e)[0]
+          so = e_shoff + ei * es
+          si = struct.unpack_from('<Q', data, so + 0x18)[0]
+          for i in range(en):
+              off = e_shoff + i * es
+              no = struct.unpack_from('<I', data, off)[0]
+              sz = struct.unpack_from('<Q', data, off + 0x20)[0]
+              end = data.index(0, si + no)
+              name = data[si+no:end].decode('ascii', errors='replace')
               if 'this_module' in name:
-                  print(f'this_module size: {sh_size} bytes (device expects 1600)')
+                  print(f'this_module size: {sz} bytes')
                   break
           "
 
