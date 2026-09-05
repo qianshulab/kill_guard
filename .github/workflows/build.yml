@@ -7,139 +7,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download kernel source
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev
+
+      - name: Download and prepare kernel
         run: |
           cd /tmp
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.38.tar.xz
           tar xf linux-6.12.38.tar.xz
-
-      - name: Setup kernel config
-        run: |
-          cd /tmp/linux-6.12.38
-          # Use a minimal ARM64 config that enables modules and kprobes
-          cat > .config << 'EOF'
-          CONFIG_ARM64=y
-          CONFIG_MODULES=y
-          CONFIG_KPROBES=y
-          CONFIG_MODULE_UNLOAD=y
-          CONFIG_MODULE_SIG=n
-          CONFIG_MODULE_SIG_FORCE=n
-          EOF
+          cd linux-6.12.38
           make ARCH=arm64 defconfig
-          # Ensure our options are set
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
           ./scripts/config --enable CONFIG_MODULE_UNLOAD
           ./scripts/config --disable CONFIG_MODULE_SIG
           ./scripts/config --disable CONFIG_MODULE_SIG_FORCE
-          make ARCH=arm64 olddefconfig
-          make ARCH=arm64 prepare -j$(nproc)
+          ./scripts/config --disable CONFIG_DEBUG_INFO
+          make ARCH=arm64 prepare -j$(nproc) 2>&1 | tail -5 || true
+          echo "Kernel prepare done (some warnings OK)"
 
       - name: Build module
         run: |
-          cd /tmp/linux-6.12.38
-          cat > /tmp/kill_guard.c << 'MODULE_EOF'
-          #include <linux/module.h>
-          #include <linux/kernel.h>
-          #include <linux/kprobes.h>
-          #include <linux/init.h>
-
-          static int target_pid = 0;
-          module_param(target_pid, int, 0644);
-          MODULE_PARM_DESC(target_pid, "PID to protect from SIGKILL");
-
-          static int block_mode = 0;
-          module_param(block_mode, int, 0644);
-          MODULE_PARM_DESC(block_mode, "0=observe, 1=block");
-
-          static int kill_count = 0;
-
-          static int kill_pre_handler(struct kprobe *p, struct pt_regs *regs)
-          {
-              long pid = regs->regs[0];
-              int sig = (int)regs->regs[1];
-              if (sig == 9 && pid == target_pid) {
-                  kill_count++;
-                  if (block_mode) {
-                      printk(KERN_INFO "kill_guard: BLOCKED SIGKILL #%d to pid=%ld\n", kill_count, pid);
-                      regs->regs[0] = -EPERM;
-                      regs->pc = regs->regs[30];
-                  } else {
-                      printk(KERN_INFO "kill_guard: observed SIGKILL #%d to pid=%ld\n", kill_count, pid);
-                  }
-              }
-              return 0;
-          }
-
-          static int tgkill_pre_handler(struct kprobe *p, struct pt_regs *regs)
-          {
-              long tgid = regs->regs[0];
-              long tid = regs->regs[1];
-              int sig = (int)regs->regs[2];
-              if (sig == 9 && (tgid == target_pid || tid == target_pid)) {
-                  kill_count++;
-                  if (block_mode) {
-                      printk(KERN_INFO "kill_guard: BLOCKED tgkill #%d\n", kill_count);
-                      regs->regs[0] = -EPERM;
-                      regs->pc = regs->regs[30];
-                  }
-              }
-              return 0;
-          }
-
-          static struct kprobe kp_kill = {
-              .symbol_name = "__arm64_sys_kill",
-              .pre_handler = kill_pre_handler,
-          };
-
-          static struct kprobe kp_tgkill = {
-              .symbol_name = "__arm64_sys_tgkill",
-              .pre_handler = tgkill_pre_handler,
-          };
-
-          static int __init kill_guard_init(void)
-          {
-              int ret;
-              ret = register_kprobe(&kp_kill);
-              if (ret < 0) return ret;
-              ret = register_kprobe(&kp_tgkill);
-              if (ret < 0) { unregister_kprobe(&kp_kill); return ret; }
-              printk(KERN_INFO "kill_guard: loaded (pid=%d mode=%s)\n",
-                     target_pid, block_mode ? "BLOCK" : "OBSERVE");
-              return 0;
-          }
-
-          static void __exit kill_guard_exit(void)
-          {
-              unregister_kprobe(&kp_kill);
-              unregister_kprobe(&kp_tgkill);
-              printk(KERN_INFO "kill_guard: unloaded (%d kills blocked)\n", kill_count);
-          }
-
-          module_init(kill_guard_init);
-          module_exit(kill_guard_exit);
-          MODULE_LICENSE("GPL");
-          MODULE_DESCRIPTION("Block SIGKILL to target PID");
-          MODULE_EOF
-
-          mkdir -p /tmp/module_build
-          cp /tmp/kill_guard.c /tmp/module_build/
-          cat > /tmp/module_build/Makefile << 'MAKE_EOF'
-          obj-m += kill_guard.o
-          KDIR := /tmp/linux-6.12.38
-          all:
-          	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
-          MAKE_EOF
-
-          # Install cross-compiler
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-
-          cd /tmp/module_build
-          make
+          mkdir -p /tmp/modbuild
+          cp $GITHUB_WORKSPACE/kill_guard.c /tmp/modbuild/
+          printf 'obj-m += kill_guard.o\nKDIR := /tmp/linux-6.12.38\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules\n' > /tmp/modbuild/Makefile
+          cd /tmp/modbuild
+          make 2>&1 | tail -10
+          ls -la kill_guard.ko
+          file kill_guard.ko
 
       - name: Upload module
         uses: actions/upload-artifact@v4
         with:
           name: kill_guard-module
-          path: /tmp/module_build/kill_guard.ko
+          path: /tmp/modbuild/kill_guard.ko
+          retention-days: 30
