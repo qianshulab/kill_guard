@@ -1,4 +1,4 @@
-name: Build kill_guard kernel module
+name: Build kill_guard with OnePlus kernel
 on: [push, workflow_dispatch]
 
 jobs:
@@ -11,18 +11,19 @@ jobs:
       - name: Install cross-compiler
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev
 
-      - name: Download kernel
+      - name: Clone OnePlus SM8845 kernel
         run: |
           cd /tmp
-          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.38.tar.xz
-          tar xf linux-6.12.38.tar.xz
+          git clone --depth 1 --branch oneplus/sm8845_b_16.0.0_ace_6t \
+            --single-branch \
+            https://github.com/OnePlusOSS/android_kernel_oneplus_sm8845.git kernel
+          cd kernel
+          echo "Kernel version: $(grep 'VERSION\|PATCHLEVEL\|SUBLEVEL' Makefile | head -3)"
 
-      - name: Configure with device config
+      - name: Configure kernel
         run: |
-          cd /tmp/linux-6.12.38
-          # 用设备的确切配置
+          cd /tmp/kernel
           cp $GITHUB_WORKSPACE/device_config.txt .config
-          # 确保模块相关选项
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
           ./scripts/config --enable CONFIG_MODULE_UNLOAD
@@ -30,40 +31,47 @@ jobs:
           ./scripts/config --disable CONFIG_MODULE_SIG_FORCE
           ./scripts/config --disable CONFIG_DEBUG_INFO
           ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
-          ./scripts/config --disable CONFIG_DEBUG_INFO_DWARF5
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 
-      - name: Fix UTS_RELEASE
+      - name: Build kill_guard
         run: |
-          cd /tmp/linux-6.12.38
-          echo '#define UTS_RELEASE "6.12.38-android16-5-g844001fb8721-ab14552068-4k"' > include/generated/utsrelease.h
-          echo "UTS_RELEASE set to device version"
-
-      - name: Build kernel modules (generates Module.symvers)
-        run: |
-          cd /tmp/linux-6.12.38
+          cd /tmp/kernel
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare -j$(nproc) 2>&1 | tail -3
-          # 构建 scripts/mod 以生成 modpost
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- scripts/mod/ 2>&1 | tail -3 || true
-          # 尝试构建一个简单内核模块以生成 Module.symvers
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- M=kernel/rcu 2>&1 | tail -3 || true
-          ls Module.symvers 2>/dev/null && echo "Module.symvers OK" || echo "No Module.symvers, using KBUILD_MODPOST_WARN"
 
-      - name: Build kill_guard module
-        run: |
           mkdir -p /tmp/modbuild
           cp $GITHUB_WORKSPACE/kill_guard.c /tmp/modbuild/
-          printf 'obj-m += kill_guard.o\nKDIR := /tmp/linux-6.12.38\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_MODPOST_WARN=1 modules\n' > /tmp/modbuild/Makefile
+          printf 'obj-m += kill_guard.o\nKDIR := /tmp/kernel\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- KBUILD_MODPOST_WARN=1 modules\n' > /tmp/modbuild/Makefile
+
           cd /tmp/modbuild
-          make 2>&1 | tail -10
+          make 2>&1 | tail -15
           ls -la kill_guard.ko
           file kill_guard.ko
-          # 验证 vermagic
           strings kill_guard.ko | grep vermagic
+
+          # 检查 struct module 大小
+          python3 -c "
+          import struct
+          data = open('kill_guard.ko','rb').read()
+          e_shoff = struct.unpack_from('<Q', data, 0x28)[0]
+          e_shentsize = struct.unpack_from('<H', data, 0x3a)[0]
+          e_shnum = struct.unpack_from('<H', data, 0x3c)[0]
+          e_shstrndx = struct.unpack_from('<H', data, 0x3e)[0]
+          shstr_off = e_shoff + e_shstrndx * e_shentsize
+          shstr_offset = struct.unpack_from('<Q', data, shstr_off + 0x18)[0]
+          for i in range(e_shnum):
+              off = e_shoff + i * e_shentsize
+              name_off = struct.unpack_from('<I', data, off)[0]
+              sh_size = struct.unpack_from('<Q', data, off + 0x20)[0]
+              end = data.index(0, shstr_offset + name_off)
+              name = data[shstr_offset+name_off:end].decode('ascii', errors='replace')
+              if 'this_module' in name:
+                  print(f'this_module size: {sh_size} bytes (device expects 1600)')
+                  break
+          "
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: kill_guard-module
+          name: kill_guard-oplus
           path: /tmp/modbuild/kill_guard.ko
           retention-days: 30
