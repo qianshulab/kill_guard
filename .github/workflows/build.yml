@@ -12,21 +12,30 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu flex bison bc libssl-dev
 
-      - name: Download and prepare kernel
+      - name: Download kernel
         run: |
           cd /tmp
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.38.tar.xz
           tar xf linux-6.12.38.tar.xz
-          cd linux-6.12.38
-          make ARCH=arm64 defconfig
+
+      - name: Configure kernel
+        run: |
+          cd /tmp/linux-6.12.38
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
           ./scripts/config --enable CONFIG_MODULE_UNLOAD
           ./scripts/config --disable CONFIG_MODULE_SIG
           ./scripts/config --disable CONFIG_MODULE_SIG_FORCE
           ./scripts/config --disable CONFIG_DEBUG_INFO
-          make ARCH=arm64 prepare -j$(nproc) 2>&1 | tail -5 || true
-          echo "Kernel prepare done (some warnings OK)"
+          ./scripts/config --disable CONFIG_DEBUG_INFO_BTF
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+      - name: Prepare kernel
+        run: |
+          cd /tmp/linux-6.12.38
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- prepare -j$(nproc) 2>&1 | tail -3
+          ls include/generated/bounds.h && echo "bounds.h OK"
 
       - name: Build module
         run: |
@@ -34,7 +43,7 @@ jobs:
           cp $GITHUB_WORKSPACE/kill_guard.c /tmp/modbuild/
           printf 'obj-m += kill_guard.o\nKDIR := /tmp/linux-6.12.38\nall:\n\t$(MAKE) -C $(KDIR) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules\n' > /tmp/modbuild/Makefile
           cd /tmp/modbuild
-          make 2>&1 | tail -10
+          make 2>&1 | tail -15
           ls -la kill_guard.ko
           file kill_guard.ko
 
